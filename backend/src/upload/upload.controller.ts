@@ -12,6 +12,7 @@ import {
   ForbiddenException,
   Req,
 } from '@nestjs/common';
+import { perf } from '../common/perf';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
 import { extname } from 'path';
@@ -32,6 +33,9 @@ export class UploadController {
     private readonly addressValidator: AddressValidatorService,
   ) {}
 
+  // ---------------------------------------------------------------------------
+  // Auth helpers
+  // ---------------------------------------------------------------------------
   private extractBearerToken(req: Request): string | null {
     const authHeader = (req.headers['authorization'] ||
       req.headers['Authorization']) as string | undefined;
@@ -54,7 +58,7 @@ export class UploadController {
     }
 
     const { data, error } = await this.databaseService
-      .getClient()
+      .getPublicClient()
       .auth.getUser(token);
 
     if (error || !data?.user) {
@@ -65,130 +69,84 @@ export class UploadController {
 
     return data.user;
   }
-
   private async consumeCreditsOrFail(userId: string, amount: number) {
-    if (!Number.isFinite(amount) || amount <= 0) return;
+  if (!Number.isFinite(amount) || amount <= 0) return;
 
-    const { data: profile, error: readErr } = await this.databaseService
-      .getClient()
-      .from('profiles')
-      .select('id, credits_remaining')
-      .eq('id', userId)
-      .single();
+  // lecture credits
+  const { data: profile, error: readErr } = await this.databaseService
+    .getClient()
+    .from('profiles')
+    .select('id, credits_remaining')
+    .eq('id', userId)
+    .single();
 
-    if (readErr) throw readErr;
-    if (!profile) {
-      throw new ForbiddenException('Profil utilisateur introuvable (credits).');
-    }
-
-    const current = Number(profile.credits_remaining ?? 0);
-
-    if (current < amount) {
-      throw new ForbiddenException(
-        `Crédits insuffisants. Requis: ${amount}, disponibles: ${current}.`,
-      );
-    }
-
-    const attemptUpdate = async (expectedCurrent: number) => {
-      const { data, error } = await this.databaseService
-        .getClient()
-        .from('profiles')
-        .update({ credits_remaining: expectedCurrent - amount })
-        .eq('id', userId)
-        .eq('credits_remaining', expectedCurrent)
-        .select('id, credits_remaining');
-
-      if (error) throw error;
-      return data && data.length > 0 ? data[0] : null;
-    };
-
-    let updated = await attemptUpdate(current);
-    if (updated) return;
-
-    const { data: profile2, error: readErr2 } = await this.databaseService
-      .getClient()
-      .from('profiles')
-      .select('id, credits_remaining')
-      .eq('id', userId)
-      .single();
-
-    if (readErr2) throw readErr2;
-
-    const current2 = Number(profile2?.credits_remaining ?? 0);
-    if (current2 < amount) {
-      throw new ForbiddenException(
-        `Crédits insuffisants. Requis: ${amount}, disponibles: ${current2}.`,
-      );
-    }
-
-    updated = await attemptUpdate(current2);
-    if (!updated) {
-      throw new BadRequestException(
-        'Impossible de consommer les crédits (concurrence). Réessayez.',
-      );
-    }
+  if (readErr) throw readErr;
+  if (!profile) {
+    throw new ForbiddenException('Profil utilisateur introuvable (credits).');
   }
 
-  @Get('my-uploads')
-  async getMyUploads(@Req() req: Request) {
-    const user = await this.getSupabaseUserFromRequest(req);
+  const current = Number(profile.credits_remaining ?? 0);
 
+  if (current < amount) {
+    throw new ForbiddenException(
+      `Crédits insuffisants. Requis: ${amount}, disponibles: ${current}.`,
+    );
+  }
+
+  // update optimiste (évite race conditions)
+  const attemptUpdate = async (expectedCurrent: number) => {
     const { data, error } = await this.databaseService
       .getClient()
-      .from('uploads')
-      .select(
-        'id, filename, status, total_deliveries, total_clients, total_amount, created_at',
-      )
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: false });
+      .from('profiles')
+      .update({ credits_remaining: expectedCurrent - amount })
+      .eq('id', userId)
+      .eq('credits_remaining', expectedCurrent)
+      .select('id, credits_remaining');
 
-    if (error) {
-      throw new BadRequestException(`Erreur récupération uploads: ${error.message}`);
-    }
+    if (error) throw error;
+    return data && data.length > 0 ? data[0] : null;
+  };
 
-    return { success: true, uploads: data ?? [] };
+  let updated = await attemptUpdate(current);
+  if (updated) return;
+
+  // retry (quelqu’un a modifié credits entre temps)
+  const { data: profile2, error: readErr2 } = await this.databaseService
+    .getClient()
+    .from('profiles')
+    .select('id, credits_remaining')
+    .eq('id', userId)
+    .single();
+
+  if (readErr2) throw readErr2;
+
+  const current2 = Number(profile2?.credits_remaining ?? 0);
+  if (current2 < amount) {
+    throw new ForbiddenException(
+      `Crédits insuffisants. Requis: ${amount}, disponibles: ${current2}.`,
+    );
   }
 
-  @Delete(':id')
-  async deleteUpload(@Param('id') uploadId: string, @Req() req: Request) {
-    try {
-      const user = await this.getSupabaseUserFromRequest(req);
-
-      const { data: upload, error: checkError } = await this.databaseService
-        .getClient()
-        .from('uploads')
-        .select('id, user_id')
-        .eq('id', uploadId)
-        .single();
-
-      if (checkError) throw checkError;
-
-      if (!upload || upload.user_id !== user.id) {
-        throw new ForbiddenException('Accès refusé à cet upload');
-      }
-
-      const { error } = await this.databaseService
-        .getClient()
-        .from('uploads')
-        .delete()
-        .eq('id', uploadId);
-
-      if (error) throw error;
-
-      return { success: true, message: 'Upload supprimé' };
-    } catch (error: any) {
-      if (error instanceof ForbiddenException) throw error;
-      throw new BadRequestException(error?.message || 'Erreur suppression upload');
-    }
+  updated = await attemptUpdate(current2);
+  if (!updated) {
+    throw new BadRequestException(
+      'Impossible de consommer les crédits (concurrence). Réessayez.',
+    );
   }
+}
 
+
+  // ---------------------------------------------------------------------------
+  // Upload file
+  // ---------------------------------------------------------------------------
   @Post()
   @UseInterceptors(
     FileInterceptor('file', {
       storage: diskStorage({
-        destination: './uploads',
+        destination: './uploads', // temporaire uniquement
         filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+          const uniqueSuffix =
+            Date.now() + '-' + Math.round(Math.random() * 1e9);
           const ext = extname(file.originalname);
           cb(null, `${file.fieldname}-${uniqueSuffix}${ext}`);
         },
@@ -200,7 +158,9 @@ export class UploadController {
         if (allowedExtensions.includes(ext)) cb(null, true);
         else {
           cb(
-            new BadRequestException('Format non supporté. Utilisez .xlsx, .xls ou .csv'),
+            new BadRequestException(
+              'Format non supporté. Utilisez .xlsx, .xls ou .csv',
+            ),
             false,
           );
         }
@@ -208,38 +168,75 @@ export class UploadController {
       limits: { fileSize: 10 * 1024 * 1024 },
     }),
   )
-  async uploadFile(@UploadedFile() file: Express.Multer.File, @Req() req: Request) {
+  async uploadFile(
+    @UploadedFile() file: Express.Multer.File,
+    @Req() req: Request,
+  ) {
     if (!file) throw new BadRequestException('Aucun fichier fourni');
 
-    let userId: string | null = null;
-    try {
-      const user = await this.getSupabaseUserFromRequest(req);
-      userId = user.id;
-    } catch (e) {
-      console.warn('⚠️ Upload sans authentification');
-    }
+    // 🔐 upload obligatoirement authentifié
+    const user = await this.getSupabaseUserFromRequest(req);
+    const userId = user.id;
 
     console.log(`📁 Fichier reçu: ${file.originalname}`);
+    const tAll = perf(`uploadFile all | file=${file.originalname}`);
 
     try {
+      // ----------------------------------------------------
+      // 1) Parse fichier (local, temporaire)
+      // ----------------------------------------------------
+      const tParse = perf('parse file');
+
       let deliveries;
       const ext = extname(file.originalname).toLowerCase();
-      if (ext === '.csv') deliveries = this.uploadService.parseCSVFile(file.path);
-      else deliveries = this.uploadService.parseExcelFile(file.path);
-
-      const upload = await this.databaseService.createUpload(file.originalname);
-
-      if (userId) {
-        await this.databaseService.updateUpload(upload.id, { user_id: userId });
-        console.log(`✅ Upload créé: ${upload.id} (user_id=${userId})`);
+      if (ext === '.csv') {
+        deliveries = this.uploadService.parseCSVFile(file.path);
       } else {
-        console.log(`✅ Upload créé: ${upload.id} (sans user_id)`);
+        deliveries = this.uploadService.parseExcelFile(file.path);
       }
 
+      tParse.end({ rows: deliveries.length });
+
+      // ----------------------------------------------------
+      // 2) Create upload (DB)
+      // ----------------------------------------------------
+      const tCreateUpload = perf('db createUpload');
+
+      const upload = await this.databaseService.createUpload({
+        filename: file.originalname,
+        user_id: userId,
+      });
+
+      tCreateUpload.end({ uploadId: upload.id });
+      console.log(`✅ Upload créé: ${upload.id}`);
+
+      // ----------------------------------------------------
+      // 3) Upload fichier vers Supabase Storage ✅
+      // ----------------------------------------------------
+      const tStorage = perf('storage upload');
+
+      const storageInfo =
+        await this.databaseService.uploadLocalFileToStorage({
+          localPath: file.path,
+          originalName: file.originalname,
+          userId,
+          uploadId: upload.id,
+        });
+
+      await this.databaseService.updateUpload(upload.id, {
+        storage_bucket: storageInfo.bucket,
+        storage_path: storageInfo.storage_path,
+      });
+
+      tStorage.end(storageInfo);
+
+      // ----------------------------------------------------
+      // 4) Validation + batch insert pending_deliveries
+      // ----------------------------------------------------
       let validCount = 0;
       let invalidCount = 0;
 
-      for (const delivery of deliveries) {
+      const rowsToInsert = deliveries.map((delivery) => {
         const validation = this.addressValidator.validateAddress(
           delivery.number,
           delivery.street,
@@ -248,7 +245,10 @@ export class UploadController {
           delivery.country,
         );
 
-        await this.databaseService.createPendingDelivery({
+        if (validation.isValid) validCount++;
+        else invalidCount++;
+
+        return {
           upload_id: upload.id,
           client_name: delivery.clientName,
           original_number: delivery.number,
@@ -265,15 +265,28 @@ export class UploadController {
           driver: delivery.driver,
           task_id: delivery.taskId,
           status: delivery.status,
-        });
+        };
+      });
 
-        if (validation.isValid) validCount++;
-        else invalidCount++;
-      }
+      const tPending = perf('db insert pending_deliveries (batch)');
+      await this.databaseService.createPendingDeliveriesBatch(rowsToInsert, 200);
+      tPending.end({ inserted: rowsToInsert.length });
+
+      // ----------------------------------------------------
+      // 5) Update upload status
+      // ----------------------------------------------------
+      const tUpdateUpload = perf('db updateUpload');
 
       await this.databaseService.updateUpload(upload.id, {
         status: invalidCount > 0 ? 'pending_validation' : 'ready',
         total_deliveries: deliveries.length,
+      });
+
+      tUpdateUpload.end();
+      tAll.end({
+        uploadId: upload.id,
+        total: deliveries.length,
+        invalid: invalidCount,
       });
 
       return {
@@ -292,14 +305,38 @@ export class UploadController {
       };
     } catch (error: any) {
       console.error('❌ Erreur upload:', error);
-      throw new BadRequestException(`Erreur lors du traitement: ${error.message}`);
+      throw new BadRequestException(
+        `Erreur lors du traitement: ${error.message}`,
+      );
     }
+  }
+  @Get('my-uploads')
+  async getMyUploads(@Req() req: Request) {
+    const user = await this.getSupabaseUserFromRequest(req);
+    const userId = user.id;
+
+    const { data, error } = await this.databaseService
+      .getClient()
+      .from('uploads')
+      .select(
+        'id, filename, status, total_deliveries, total_clients, total_amount, created_at, storage_bucket, storage_path',
+      )
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    return {
+      success: true,
+      uploads: data ?? [],
+    };
   }
 
   @Get(':id/invalid-addresses')
   async getInvalidAddresses(@Param('id') uploadId: string) {
     try {
-      const invalidDeliveries = await this.databaseService.getInvalidDeliveriesByUpload(uploadId);
+      const invalidDeliveries =
+        await this.databaseService.getInvalidDeliveriesByUpload(uploadId);
 
       return {
         success: true,
@@ -320,7 +357,13 @@ export class UploadController {
     @Param('id') uploadId: string,
     @Param('addressId') addressId: string,
     @Body()
-    correction: { number: string; street: string; postalCode: string; city: string; country: string },
+    correction: {
+      number: string;
+      street: string;
+      postalCode: string;
+      city: string;
+      country: string;
+    },
   ) {
     try {
       const validation = this.addressValidator.validateAddress(
@@ -367,13 +410,9 @@ export class UploadController {
   async processUpload(@Param('id') uploadId: string, @Req() req: Request) {
     console.log(`🎯 POST /upload/${uploadId}/process - Début`);
 
-    let userId: string | null = null;
-    try {
-      const user = await this.getSupabaseUserFromRequest(req);
-      userId = user.id;
-    } catch (e) {
-      console.warn('⚠️ Process sans authentification (pas de consommation de crédits)');
-    }
+    // ✅ Requis pour consommer des crédits et sécuriser l'accès
+    const user = await this.getSupabaseUserFromRequest(req);
+    const userId = user.id;
 
     if (processingLocks.has(uploadId)) {
       return { success: true, message: 'Le traitement est déjà en cours', upload_id: uploadId };
@@ -394,14 +433,21 @@ export class UploadController {
     }, watchdogMs);
 
     try {
-      const uploadCheck = await this.databaseService
+      // ✅ check ownership: l'upload doit appartenir à l'utilisateur
+      const { data: uploadRow, error: uploadErr } = await this.databaseService
         .getClient()
         .from('uploads')
-        .select('status')
+        .select('id, status, user_id')
         .eq('id', uploadId)
         .single();
 
-      const currentStatus = uploadCheck.data?.status;
+      if (uploadErr) throw uploadErr;
+
+      if (!uploadRow || uploadRow.user_id !== userId) {
+        throw new ForbiddenException('Accès refusé à cet upload');
+      }
+
+      const currentStatus = uploadRow.status;
 
       if (currentStatus === 'processing') {
         return { success: true, message: 'Le traitement est déjà en cours', upload_id: uploadId };
@@ -441,17 +487,13 @@ export class UploadController {
         status: d.status,
       }));
 
-      if (userId) {
-        try {
-          await this.consumeCreditsOrFail(userId, deliveriesToProcess.length);
-        } catch (creditErr: any) {
-          await this.databaseService.updateUpload(uploadId, { status: 'ready' });
+      try {
+        await this.consumeCreditsOrFail(userId, deliveriesToProcess.length);
+      } catch (creditErr: any) {
+        await this.databaseService.updateUpload(uploadId, { status: 'ready' });
 
-          if (creditErr instanceof ForbiddenException) throw creditErr;
-          throw new BadRequestException(creditErr?.message || 'Erreur consommation crédits');
-        }
-      } else {
-        console.warn('⚠️ Pas de consommation de crédits (utilisateur non authentifié)');
+        if (creditErr instanceof ForbiddenException) throw creditErr;
+        throw new BadRequestException(creditErr?.message || 'Erreur consommation crédits');
       }
 
       (async () => {
@@ -495,8 +537,10 @@ export class UploadController {
   }
 
   @Get(':id/status')
-  async getUploadStatus(@Param('id') uploadId: string) {
+  async getUploadStatus(@Param('id') uploadId: string, @Req() req: Request) {
     try {
+      const user = await this.getSupabaseUserFromRequest(req);
+
       const upload = await this.databaseService
         .getClient()
         .from('uploads')
@@ -506,16 +550,35 @@ export class UploadController {
 
       if (upload.error) throw upload.error;
 
+      if (!upload.data || upload.data.user_id !== user.id) {
+        throw new ForbiddenException('Accès refusé à cet upload');
+      }
+
       return { success: true, upload: upload.data };
     } catch (error: any) {
+      if (error instanceof ForbiddenException) throw error;
       throw new BadRequestException(`Erreur récupération status: ${error.message}`);
     }
   }
 
   @Get(':id/clients')
-    @Get(':id/clients')
-  async getClientsByUpload(@Param('id') uploadId: string) {
+  async getClientsByUpload(@Param('id') uploadId: string, @Req() req: Request) {
     try {
+      const user = await this.getSupabaseUserFromRequest(req);
+
+      // ownership check
+      const { data: up, error: upErr } = await this.databaseService
+        .getClient()
+        .from('uploads')
+        .select('id, user_id')
+        .eq('id', uploadId)
+        .single();
+
+      if (upErr) throw upErr;
+      if (!up || up.user_id !== user.id) {
+        throw new ForbiddenException('Accès refusé à cet upload');
+      }
+
       // 1) récupérer les clients (sans se fier aux totaux stockés)
       const { data: clients, error: cErr } = await this.databaseService
         .getClient()
@@ -544,7 +607,7 @@ export class UploadController {
         price_ttc: number | null;
       }>;
 
-      // 3) agrégation en mémoire (rapide et fiable)
+      // 3) agrégation en mémoire
       const agg = new Map<
         string,
         { total_deliveries: number; total_amount_ht: number; total_amount_ttc: number }
@@ -573,7 +636,6 @@ export class UploadController {
           total_amount_ttc: 0,
         };
 
-        // arrondi 2 décimales (évite les 12.000000004)
         const round2 = (n: number) => Math.round(n * 100) / 100;
 
         return {
@@ -596,30 +658,45 @@ export class UploadController {
         clients: result,
       };
     } catch (error: any) {
+      if (error instanceof ForbiddenException) throw error;
       throw new BadRequestException(
         `Erreur récupération clients: ${error?.message || error}`,
       );
     }
   }
 
-
   @Get(':id/deliveries')
-  async getDeliveriesByUpload(@Param('id') uploadId: string) {
+  async getDeliveriesByUpload(@Param('id') uploadId: string, @Req() req: Request) {
     try {
+      const user = await this.getSupabaseUserFromRequest(req);
+
+      // ownership check
+      const { data: up, error: upErr } = await this.databaseService
+        .getClient()
+        .from('uploads')
+        .select('id, user_id')
+        .eq('id', uploadId)
+        .single();
+
+      if (upErr) throw upErr;
+      if (!up || up.user_id !== user.id) {
+        throw new ForbiddenException('Accès refusé à cet upload');
+      }
+
       console.log(`📦 [DELIVERIES] Requête deliveries pour upload=${uploadId}`);
 
       const clients = await this.databaseService.getClientsByUpload(uploadId);
 
       const allDeliveries: any[] = [];
-      
+
       for (const client of clients) {
         const deliveries = await this.databaseService.getDeliveriesByClient(client.id);
-        
+
         const enrichedDeliveries = deliveries.map((d) => ({
           ...d,
           client_name: client.name,
         }));
-        
+
         allDeliveries.push(...enrichedDeliveries);
       }
 
@@ -632,6 +709,7 @@ export class UploadController {
         deliveries: allDeliveries,
       };
     } catch (error: any) {
+      if (error instanceof ForbiddenException) throw error;
       console.error(`❌ [DELIVERIES] Erreur:`, error);
       throw new BadRequestException(error?.message || 'Erreur récupération livraisons');
     }
@@ -643,8 +721,24 @@ export class UploadController {
   async savePricingConfig(
     @Param('id') uploadId: string,
     @Body() body: { tiers: any[] },
+    @Req() req: Request,
   ) {
     try {
+      const user = await this.getSupabaseUserFromRequest(req);
+
+      // ownership check
+      const { data: up, error: upErr } = await this.databaseService
+        .getClient()
+        .from('uploads')
+        .select('id, user_id')
+        .eq('id', uploadId)
+        .single();
+
+      if (upErr) throw upErr;
+      if (!up || up.user_id !== user.id) {
+        throw new ForbiddenException('Accès refusé à cet upload');
+      }
+
       console.log(`💰 [PRICING-CONFIG] Save pour upload=${uploadId}`);
 
       await this.databaseService.updateUpload(uploadId, {
@@ -658,14 +752,32 @@ export class UploadController {
         message: 'Configuration de tarification enregistrée',
       };
     } catch (error: any) {
+      if (error instanceof ForbiddenException) throw error;
       console.error(`❌ [PRICING-CONFIG] Erreur:`, error);
-      throw new BadRequestException(error?.message || 'Erreur enregistrement tarification');
+      throw new BadRequestException(
+        error?.message || 'Erreur enregistrement tarification',
+      );
     }
   }
 
   @Post(':id/apply-pricing')
-  async applyPricing(@Param('id') uploadId: string) {
+  async applyPricing(@Param('id') uploadId: string, @Req() req: Request) {
     try {
+      const user = await this.getSupabaseUserFromRequest(req);
+
+      // ownership check
+      const { data: up, error: upErr } = await this.databaseService
+        .getClient()
+        .from('uploads')
+        .select('id, user_id')
+        .eq('id', uploadId)
+        .single();
+
+      if (upErr) throw upErr;
+      if (!up || up.user_id !== user.id) {
+        throw new ForbiddenException('Accès refusé à cet upload');
+      }
+
       console.log(`💰 [APPLY-PRICING] Début pour upload=${uploadId}`);
 
       const upload = await this.databaseService.getUploadById(uploadId);
@@ -719,7 +831,9 @@ export class UploadController {
         total_amount: Math.round(totalAmountTTC * 100) / 100,
       });
 
-      console.log(`✅ [APPLY-PRICING] Terminé - Total TTC: ${totalAmountTTC.toFixed(2)} €`);
+      console.log(
+        `✅ [APPLY-PRICING] Terminé - Total TTC: ${totalAmountTTC.toFixed(2)} €`,
+      );
 
       return {
         success: true,
@@ -728,8 +842,11 @@ export class UploadController {
         total_ttc: Math.round(totalAmountTTC * 100) / 100,
       };
     } catch (error: any) {
+      if (error instanceof ForbiddenException) throw error;
       console.error(`❌ [APPLY-PRICING] Erreur:`, error);
-      throw new BadRequestException(error?.message || 'Erreur application tarification');
+      throw new BadRequestException(
+        error?.message || 'Erreur application tarification',
+      );
     }
   }
 

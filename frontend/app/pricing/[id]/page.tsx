@@ -32,17 +32,44 @@ function sortTiers(tiers: Tier[]) {
   return [...tiers].sort((a, b) => a.range_start - b.range_start);
 }
 
+/**
+ * ✅ Parse "fr" decimal input:
+ * - accepte "3,5" et "3.5"
+ * - ignore espaces
+ * - refuse NaN
+ */
+function parseFrNumber(raw: string): number | null {
+  const s = String(raw ?? '').trim().replace(/\s+/g, '').replace(',', '.');
+  if (s === '') return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * ✅ Format display in French style (comma)
+ * - max 2 decimals (sans forcer)
+ */
+function formatFrNumber(v: number | null): string {
+  if (v == null || !Number.isFinite(v)) return '';
+  const rounded = Math.round(v * 100) / 100;
+  const s = String(rounded);
+  return s.replace('.', ',');
+}
+
 function validateTiers(tiers: Tier[]) {
   const errors: string[] = [];
   const t = sortTiers(tiers);
-  
+
   if (t.length === 0) errors.push('Ajoute au moins une tranche.');
-  
+
   t.forEach((r, i) => {
     if (!Number.isFinite(r.range_start) || r.range_start < 0) {
       errors.push(`Tranche #${i + 1}: début (km) invalide.`);
     }
-    if (r.range_end !== null && (!Number.isFinite(r.range_end) || r.range_end <= r.range_start)) {
+    if (
+      r.range_end !== null &&
+      (!Number.isFinite(r.range_end) || r.range_end <= r.range_start)
+    ) {
       errors.push(`Tranche #${i + 1}: fin (km) doit être > début.`);
     }
     if (!Number.isFinite(r.price) || r.price < 0) {
@@ -66,7 +93,9 @@ function validateTiers(tiers: Tier[]) {
   }
 
   if (t.length > 0 && t[0].range_start !== 0) {
-    errors.push('Recommandé: commencer à 0 km (sinon certaines livraisons peuvent ne pas être tarifées).');
+    errors.push(
+      'Recommandé: commencer à 0 km (sinon certaines livraisons peuvent ne pas être tarifées).',
+    );
   }
 
   return { ok: errors.length === 0, errors, sorted: t };
@@ -75,7 +104,7 @@ function validateTiers(tiers: Tier[]) {
 function computePrice(distanceKm: number, tiers: Tier[]) {
   const t = sortTiers(tiers);
   for (const r of t) {
-    const endOk = r.range_end === null || distanceKm < r.range_end;
+    const endOk = r.range_end === null || distanceKm < r.range_end; // end exclusif (cohérent avec ton UI)
     if (distanceKm >= r.range_start && endOk) {
       const ht = r.price;
       const tva = (ht * r.tva_rate) / 100;
@@ -105,14 +134,39 @@ export default function PricingPage() {
   const [deliveries, setDeliveries] = useState<Delivery[]>([]);
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  
+
   const [tiers, setTiers] = useState<Tier[]>([
     { range_start: 0, range_end: 5, price: 8, tva_rate: 20 },
     { range_start: 5, range_end: 10, price: 10, tva_rate: 20 },
     { range_start: 10, range_end: null, price: 12, tva_rate: 20 },
   ]);
 
+  // ✅ inputs texte pour accepter la virgule
+  const [tierInputs, setTierInputs] = useState<
+    Array<{
+      start: string;
+      end: string; // vide => null
+      price: string;
+      tva: string;
+    }>
+  >([]);
+
   const [openClients, setOpenClients] = useState<Record<string, boolean>>({});
+
+  // ✅ clé localStorage pour réutilisation sur dashboard (fallback UX)
+  const pricingStorageKey = useMemo(() => `kilomate_pricing_${uploadId}`, [uploadId]);
+
+  // sync inputs quand tiers change (ex: ajout/suppression)
+  useEffect(() => {
+    setTierInputs(
+      sortTiers(tiers).map((t) => ({
+        start: formatFrNumber(t.range_start),
+        end: t.range_end == null ? '' : formatFrNumber(t.range_end),
+        price: String(t.price ?? 0).replace('.', ','),
+        tva: String(t.tva_rate ?? 0).replace('.', ','),
+      })),
+    );
+  }, [tiers.length]); // volontaire: uniquement sur ajout/suppression
 
   useEffect(() => {
     const fetchDeliveries = async () => {
@@ -134,18 +188,34 @@ export default function PricingPage() {
           initialOpen[k] = count > 1;
         }
         setOpenClients(initialOpen);
+
+        // ✅ optionnel: si une grille existe déjà en localStorage, on peut préremplir
+        try {
+          const raw = localStorage.getItem(pricingStorageKey);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed) && parsed.length) {
+              const maybe = parsed
+                .map((x: any) => ({
+                  range_start: Number(x.range_start),
+                  range_end: x.range_end === null ? null : Number(x.range_end),
+                  price: Number(x.price),
+                  tva_rate: x.tva_rate == null ? 20 : Number(x.tva_rate),
+                }))
+                .filter((x: any) => Number.isFinite(x.range_start) && Number.isFinite(x.price));
+              if (maybe.length) setTiers(sortTiers(maybe));
+            }
+          }
+        } catch {}
       } catch (e: any) {
         console.error(e);
-        setErrorMsg(
-          e?.response?.data?.message ||
-            "Impossible de charger les livraisons.",
-        );
+        setErrorMsg(e?.response?.data?.message || 'Impossible de charger les livraisons.');
       } finally {
         setLoading(false);
       }
     };
     fetchDeliveries();
-  }, [uploadId]);
+  }, [uploadId, pricingStorageKey]);
 
   const { errors, sorted } = useMemo(() => validateTiers(tiers), [tiers]);
 
@@ -233,16 +303,23 @@ export default function PricingPage() {
   const removeTier = (idx: number) => setTiers(tiers.filter((_, i) => i !== idx));
 
   const updateTier = (idx: number, patch: Partial<Tier>) => {
-    setTiers(tiers.map((t, i) => (i === idx ? { ...t, ...patch } : t)));
+    setTiers((prev) => prev.map((t, i) => (i === idx ? { ...t, ...patch } : t)));
   };
 
   const toggleClient = (clientName: string) => {
     setOpenClients((prev) => ({ ...prev, [clientName]: !prev[clientName] }));
   };
 
+  /**
+   * ✅ IMPORTANT :
+   * On n'utilise PLUS /upload/:id/pricing-config ni /upload/:id/apply-pricing
+   * On utilise les routes backend standards:
+   * - POST /pricing/:uploadId/apply  (écrit pricing_config + recalc deliveries)
+   * - dashboard lit ensuite GET /pricing/:uploadId/config
+   */
   const handleSaveAndApply = async () => {
     setErrorMsg(null);
-    
+
     const hardErrors = errors.filter((e) => !e.startsWith('Recommandé:'));
     if (hardErrors.length > 0) {
       setErrorMsg('Corrige la tarification :\n' + hardErrors.join('\n'));
@@ -252,24 +329,31 @@ export default function PricingPage() {
     try {
       setSaving(true);
 
-      console.log('💰 Enregistrement de la configuration...');
-      // 1. Sauvegarder la config
-      await api.post(`/upload/${uploadId}/pricing-config`, { tiers: sorted });
+      // ✅ 1) Sauvegarde locale (UX fallback)
+      try {
+        localStorage.setItem(pricingStorageKey, JSON.stringify(sorted));
+      } catch {}
 
-      console.log('💰 Application de la tarification...');
-      // 2. Appliquer la tarification (calcule les prix en base)
-      const applyRes = await api.post(`/upload/${uploadId}/apply-pricing`);
+      // ✅ 2) Enregistre + applique côté backend (source de vérité DB)
+      console.log('💰 Application pricing via /pricing/:uploadId/apply ...');
 
-      console.log('✅ Tarification appliquée:', applyRes.data);
+      const res = await api.post(`/pricing/${encodeURIComponent(uploadId)}/apply`, {
+        pricing: sorted.map((t) => ({
+          range_start: t.range_start,
+          range_end: t.range_end,
+          price: t.price,       // ✅ DB field
+          tva_rate: t.tva_rate,
+        })),
+      });
 
-      // 3. Rediriger vers le dashboard
+      console.log('✅ Tarification appliquée:', res.data);
+
+      // ✅ 3) Go dashboard
       router.push(`/dashboard/${uploadId}`);
     } catch (e: any) {
       console.error('❌ Erreur:', e);
       setErrorMsg(
-        e?.response?.data?.message || 
-        e?.message || 
-        "Erreur lors de l'enregistrement de la tarification."
+        e?.response?.data?.message || e?.message || "Erreur lors de l'enregistrement de la tarification.",
       );
     } finally {
       setSaving(false);
@@ -284,6 +368,8 @@ export default function PricingPage() {
     );
   }
 
+  const sortedForUI = sortTiers(tiers);
+
   return (
     <div className="min-h-screen bg-gray-50 p-6">
       <div className="max-w-6xl mx-auto space-y-6">
@@ -294,8 +380,8 @@ export default function PricingPage() {
               Définis tes intervalles de distance (km). Les prix seront calculés et enregistrés en base de données.
             </p>
           </div>
-          <button 
-            onClick={() => router.back()} 
+          <button
+            onClick={() => router.back()}
             className="px-4 py-2 rounded-lg bg-white border hover:bg-gray-50"
           >
             Retour
@@ -323,59 +409,106 @@ export default function PricingPage() {
             </div>
 
             <div className="mt-4 space-y-3">
-              {sortTiers(tiers).map((t, idx) => (
+              {sortedForUI.map((t, idx) => (
                 <div key={idx} className="grid grid-cols-12 gap-2 items-end border rounded-lg p-3">
                   <div className="col-span-3">
                     <label className="block text-xs text-gray-600">Début (km)</label>
                     <input
-                      type="number"
-                      value={t.range_start}
-                      onChange={(e) => updateTier(idx, { range_start: Number(e.target.value) })}
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="ex: 2,5"
+                      value={tierInputs[idx]?.start ?? formatFrNumber(t.range_start)}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        setTierInputs((prev) => {
+                          const next = [...prev];
+                          next[idx] = { ...(next[idx] ?? { start: '', end: '', price: '', tva: '' }), start: raw };
+                          return next;
+                        });
+
+                        const n = parseFrNumber(raw);
+                        if (n != null) updateTier(idx, { range_start: n });
+                      }}
                       className="w-full border rounded px-2 py-1"
-                      min={0}
-                      step={0.1}
                     />
                   </div>
+
                   <div className="col-span-3">
                     <label className="block text-xs text-gray-600">Fin (km)</label>
                     <input
-                      type="number"
-                      value={t.range_end ?? ''}
-                      onChange={(e) =>
-                        updateTier(idx, { range_end: e.target.value === '' ? null : Number(e.target.value) })
-                      }
-                      className="w-full border rounded px-2 py-1"
-                      min={0}
-                      step={0.1}
+                      type="text"
+                      inputMode="decimal"
                       placeholder="(vide = et +)"
+                      value={tierInputs[idx]?.end ?? (t.range_end == null ? '' : formatFrNumber(t.range_end))}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        setTierInputs((prev) => {
+                          const next = [...prev];
+                          next[idx] = { ...(next[idx] ?? { start: '', end: '', price: '', tva: '' }), end: raw };
+                          return next;
+                        });
+
+                        const trimmed = raw.trim();
+                        if (trimmed === '') {
+                          updateTier(idx, { range_end: null });
+                          return;
+                        }
+
+                        const n = parseFrNumber(trimmed);
+                        if (n != null) updateTier(idx, { range_end: n });
+                      }}
+                      className="w-full border rounded px-2 py-1"
                     />
                   </div>
+
                   <div className="col-span-3">
                     <label className="block text-xs text-gray-600">Prix HT (€)</label>
                     <input
-                      type="number"
-                      value={t.price}
-                      onChange={(e) => updateTier(idx, { price: Number(e.target.value) })}
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="ex: 8,50"
+                      value={tierInputs[idx]?.price ?? String(t.price ?? 0).replace('.', ',')}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        setTierInputs((prev) => {
+                          const next = [...prev];
+                          next[idx] = { ...(next[idx] ?? { start: '', end: '', price: '', tva: '' }), price: raw };
+                          return next;
+                        });
+
+                        const n = parseFrNumber(raw);
+                        if (n != null) updateTier(idx, { price: n });
+                      }}
                       className="w-full border rounded px-2 py-1"
-                      min={0}
-                      step={0.01}
                     />
                   </div>
+
                   <div className="col-span-2">
                     <label className="block text-xs text-gray-600">TVA (%)</label>
                     <input
-                      type="number"
-                      value={t.tva_rate}
-                      onChange={(e) => updateTier(idx, { tva_rate: Number(e.target.value) })}
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="ex: 20"
+                      value={tierInputs[idx]?.tva ?? String(t.tva_rate ?? 0).replace('.', ',')}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        setTierInputs((prev) => {
+                          const next = [...prev];
+                          next[idx] = { ...(next[idx] ?? { start: '', end: '', price: '', tva: '' }), tva: raw };
+                          return next;
+                        });
+
+                        const n = parseFrNumber(raw);
+                        if (n != null) updateTier(idx, { tva_rate: n });
+                      }}
                       className="w-full border rounded px-2 py-1"
-                      min={0}
-                      step={0.1}
                     />
                   </div>
+
                   <div className="col-span-1 flex justify-end">
-                    <button 
-                      onClick={() => removeTier(idx)} 
-                      className="p-2 rounded hover:bg-gray-100" 
+                    <button
+                      onClick={() => removeTier(idx)}
+                      className="p-2 rounded hover:bg-gray-100"
                       title="Supprimer"
                     >
                       <Trash2 className="w-4 h-4 text-gray-600" />
@@ -430,10 +563,8 @@ export default function PricingPage() {
           {/* Preview by client */}
           <div className="bg-white rounded-xl shadow p-5">
             <h2 className="font-semibold text-gray-900">Aperçu par client</h2>
-            <p className="text-gray-600 text-sm mt-1">
-              Aperçu des montants qui seront enregistrés en base de données.
-            </p>
-            
+            <p className="text-gray-600 text-sm mt-1">Aperçu des montants qui seront enregistrés en base de données.</p>
+
             <div className="mt-4 space-y-3">
               {preview.clients.map((p) => (
                 <div key={p.client} className="border rounded-lg p-3">
@@ -456,16 +587,12 @@ export default function PricingPage() {
                     </div>
                     <div>
                       <div className="text-gray-500">Non tarifées</div>
-                      <div className={`font-semibold ${p.missing ? 'text-amber-700' : ''}`}>
-                        {p.missing}
-                      </div>
+                      <div className={`font-semibold ${p.missing ? 'text-amber-700' : ''}`}>{p.missing}</div>
                     </div>
                   </div>
                 </div>
               ))}
-              {preview.clients.length === 0 && (
-                <div className="text-gray-600 text-sm">Aucune livraison trouvée.</div>
-              )}
+              {preview.clients.length === 0 && <div className="text-gray-600 text-sm">Aucune livraison trouvée.</div>}
             </div>
           </div>
         </div>
@@ -482,7 +609,7 @@ export default function PricingPage() {
               const isOpen = !!openClients[client];
               const clientKm = deliveries.reduce((s, d) => s + Number(d.distance_km ?? 0), 0);
               const pricedCount = deliveries.filter(
-                (d) => d.distance_km != null && computePrice(Number(d.distance_km), tiers)
+                (d) => d.distance_km != null && computePrice(Number(d.distance_km), tiers),
               ).length;
 
               return (
@@ -494,7 +621,8 @@ export default function PricingPage() {
                     <div className="text-left">
                       <div className="font-semibold text-gray-900">{client}</div>
                       <div className="text-xs text-gray-600 mt-0.5">
-                        {deliveries.length} course(s) • {Math.round(clientKm * 100) / 100} km • {pricedCount}/{deliveries.length} tarifée(s)
+                        {deliveries.length} course(s) • {Math.round(clientKm * 100) / 100} km • {pricedCount}/
+                        {deliveries.length} tarifée(s)
                       </div>
                     </div>
                     <div className="text-gray-700">
@@ -517,7 +645,8 @@ export default function PricingPage() {
                           </thead>
                           <tbody className="divide-y">
                             {deliveries.map((d) => {
-                              const price = d.distance_km == null ? null : computePrice(Number(d.distance_km), tiers);
+                              const price =
+                                d.distance_km == null ? null : computePrice(Number(d.distance_km), tiers);
 
                               return (
                                 <tr key={d.id} className="hover:bg-gray-50">
@@ -549,9 +678,7 @@ export default function PricingPage() {
                 </div>
               );
             })}
-            {deliveriesByClient.length === 0 && (
-              <div className="text-gray-600 text-sm">Aucune course à afficher.</div>
-            )}
+            {deliveriesByClient.length === 0 && <div className="text-gray-600 text-sm">Aucune course à afficher.</div>}
           </div>
         </div>
       </div>

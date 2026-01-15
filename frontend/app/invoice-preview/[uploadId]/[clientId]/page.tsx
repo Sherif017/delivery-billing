@@ -23,6 +23,25 @@ export default function InvoicePreviewPage() {
   const [client, setClient] = useState<Client | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // ✅ Champ entreprise (persisté localStorage)
+  const storageKey = useMemo(() => `kilomate_company_name`, []);
+  const [companyName, setCompanyName] = useState<string>('');
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (saved) setCompanyName(saved);
+    } catch {}
+  }, [storageKey]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(storageKey, companyName);
+    } catch {}
+  }, [companyName, storageKey]);
+
+  const isCompanyValid = companyName.trim().length >= 2;
+
   const filename = useMemo(() => {
     const base = (client?.name || clientId)
       .replace(/[^\p{L}\p{N}\s_-]/gu, '')
@@ -45,12 +64,15 @@ export default function InvoicePreviewPage() {
         );
         setClient(found ?? { id: clientId, name: clientId });
 
-        // 2) récupérer l'HTML depuis le backend (route confirmée dans ton controller)
-        const htmlRes = await api.get(`/invoice/${uploadId}/${clientId}/html`, {
-          responseType: 'text',
-        });
-
-        setHtml(typeof htmlRes.data === 'string' ? htmlRes.data : String(htmlRes.data ?? ''));
+        // 2) Aperçu HTML (OPTIONNEL) : si route absente -> fallback silencieux
+        try {
+          const htmlRes = await api.get(`/invoice/${uploadId}/${clientId}/html`, {
+            responseType: 'text',
+          });
+          setHtml(typeof htmlRes.data === 'string' ? htmlRes.data : String(htmlRes.data ?? ''));
+        } catch {
+          setHtml('');
+        }
       } catch (e: any) {
         console.error('Erreur chargement aperçu facture:', e);
         setError(e?.response?.data?.message || "Erreur lors du chargement de l'aperçu");
@@ -63,11 +85,18 @@ export default function InvoicePreviewPage() {
   }, [uploadId, clientId]);
 
   const handleDownloadPdf = async () => {
+    if (!isCompanyValid) {
+      alert("Merci d'indiquer le nom de votre entreprise avant de télécharger.");
+      return;
+    }
+
     setDownloading(true);
     try {
-      const response = await api.get(`/invoice/${uploadId}/${clientId}`, {
-        responseType: 'blob',
-      });
+      // ✅ GET avec company_name en query (comme côté backend étape 4)
+      const response = await api.get(
+        `/invoice/${uploadId}/${clientId}?company_name=${encodeURIComponent(companyName.trim())}`,
+        { responseType: 'blob' },
+      );
 
       const blob = new Blob([response.data], { type: 'application/pdf' });
       const url = window.URL.createObjectURL(blob);
@@ -112,33 +141,50 @@ export default function InvoicePreviewPage() {
             Retour au dashboard
           </button>
 
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+          <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
             <div>
-              <h1 className="text-3xl font-bold text-gray-900">🧾 Aperçu facture (HTML)</h1>
+              <h1 className="text-3xl font-bold text-gray-900">🧾 Facture client</h1>
               <p className="text-gray-700 mt-1">
                 Client : <span className="font-semibold">{client?.name ?? clientId}</span>
                 <span className="text-gray-500"> • ID: {clientId.slice(0, 8)}…</span>
               </p>
             </div>
 
-            <button
-              onClick={handleDownloadPdf}
-              disabled={downloading}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
-              type="button"
-            >
-              {downloading ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  PDF...
-                </>
-              ) : (
-                <>
-                  <Download className="w-4 h-4" />
-                  Télécharger le PDF
-                </>
-              )}
-            </button>
+            <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+              <div className="w-full sm:w-[360px]">
+                <label className="block text-sm font-semibold text-slate-800 mb-1">
+                  Nom de votre entreprise (émetteur)
+                </label>
+                <input
+                  value={companyName}
+                  onChange={(e) => setCompanyName(e.target.value)}
+                  placeholder="ex: ACME LOGISTICS"
+                  className="w-full px-4 py-3 rounded-xl border-2 border-slate-200 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 outline-none text-slate-900 bg-white"
+                />
+                <p className="text-xs text-slate-500 mt-1">
+                  Utilisé sur toutes les factures téléchargées.
+                </p>
+              </div>
+
+              <button
+                onClick={handleDownloadPdf}
+                disabled={downloading || !isCompanyValid}
+                className="inline-flex items-center justify-center gap-2 px-4 py-3 bg-green-600 text-white font-semibold rounded-xl hover:bg-green-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
+                type="button"
+              >
+                {downloading ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Téléchargement…
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-4 h-4" />
+                    Télécharger le PDF
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -151,11 +197,20 @@ export default function InvoicePreviewPage() {
 
         <div className="bg-white rounded-xl shadow-lg border border-gray-200 overflow-hidden">
           <div className="bg-gray-50 px-4 py-3 border-b border-gray-200 text-sm text-gray-700 font-medium">
-            Rendu exact (HTML backend)
+            Aperçu
           </div>
 
           <div className="p-4 md:p-6">
-            <div dangerouslySetInnerHTML={{ __html: html }} />
+            {html ? (
+              <div dangerouslySetInnerHTML={{ __html: html }} />
+            ) : (
+              <div className="text-sm text-slate-600">
+                L’aperçu HTML n’est pas activé (route /html non disponible).  
+                <div className="mt-2">
+                  Tu peux quand même télécharger le PDF (bouton vert).
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
